@@ -1,1 +1,4 @@
-pip install streamlit pdfplumber requests scikit-learn
+streamlit
+pdfplumber 
+requests
+scikit-learn
