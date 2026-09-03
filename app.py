@@ -1,105 +1,196 @@
 import streamlit as st
-from pypdf import PdfReader
+import pdfplumber
 import requests
-from sentence_transformers import SentenceTransformer
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
 
-# Page configuration
 st.set_page_config(page_title="PhD Supervisor Scout", layout="wide")
 
-@st.cache_resource
-def load_embedder():
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-embedder = load_embedder()
-
-def extract_pdf_text(file):
-    reader = PdfReader(file)
+def extract_text_from_pdf(uploaded_file):
+    """Extract clean text handling multi-column academic CV formats."""
     text = ""
-    for page in reader.pages:
-        text += page.extract_text() or ""
-    return text
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                extracted = page.extract_text()
+                if extracted:
+                    text += extracted + "\n"
+    except Exception as e:
+        st.error(f"Error reading PDF: {e}")
+    return text.strip()
 
-def search_openalex_authors(query_text, limit=15):
-    """Fetch relevant authors from OpenAlex based on research concepts."""
-    url = f"https://api.openalex.org/authors?search={requests.utils.quote(query_text)}&per-page={limit}"
-    response = requests.get(url)
+def extract_phd_keywords(text, top_n=5):
+    """Extract niche technical n-grams rather than noisy raw CV text."""
+    # Clean non-alphanumeric noise
+    clean_text = re.sub(r'[^a-zA-Z\s]', ' ', text.lower())
+    
+    # Custom stop words common in CVs that dilute search
+    academic_stop_words = [
+        'cv', 'curriculum', 'vitae', 'resume', 'experience', 'education', 
+        'university', 'department', 'skills', 'projects', 'gpa', 'email', 
+        'phone', 'github', 'prof', 'professor', 'dr', 'student', 'bachelor', 
+        'master', 'phd', 'candidate', 'research', 'work', 'present'
+    ]
+    
+    vectorizer = TfidfVectorizer(
+        stop_words='english',
+        ngram_range=(1, 3),
+        max_df=0.85,
+        min_df=1
+    )
+    
+    try:
+        tfidf = vectorizer.fit_transform([clean_text])
+        feature_names = vectorizer.get_feature_names_out()
+        scores = tfidf.toarray()[0]
+        
+        # Filter out generic CV terms
+        ranked_terms = [
+            term for term, score in sorted(zip(feature_names, scores), key=lambda x: x[1], reverse=True)
+            if not any(w in term for w in academic_stop_words) and len(term) > 3
+        ]
+        return ranked_terms[:top_n]
+    except Exception:
+        return [word for word in clean_text.split() if len(word) > 4][:top_n]
+
+def search_semantic_scholar(query, limit=20):
+    """
+    Find relevant recent papers via Semantic Scholar API, 
+    then extract active primary investigators/supervisors.
+    """
+    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+    params = {
+        "query": query,
+        "limit": limit,
+        "fields": "title,abstract,authors,year,citationCount,venue,openAccessPdf"
+    }
+    
+    response = requests.get(url, params=params, timeout=12)
     if response.status_code == 200:
-        return response.json().get("results", [])
+        return response.json().get("data", [])
     return []
 
-# User Interface
-st.title("🎓 PhD Supervisor Scout (Local)")
-st.caption("Match your research interests or CV against academic profiles.")
+# App Header
+st.title("🎓 PhD Supervisor Scout")
+st.caption("Find potential PhD advisors by matching your CV or niche research topic against the Semantic Scholar graph.")
 
 with st.sidebar:
-    st.header("Your Profile")
-    cv_file = st.file_uploader("Upload CV (PDF)", type=["pdf"])
-    research_summary = st.text_area(
-        "Or paste research interests / thesis proposal:", 
-        height=180,
-        placeholder="e.g., Graph neural networks for drug discovery, molecular dynamics simulation..."
+    st.subheader("1. Your Background")
+    cv_file = st.file_uploader("Upload Academic CV (PDF)", type=["pdf"])
+    manual_interest = st.text_area(
+        "Or specify target research topic:",
+        placeholder="e.g., Physics-informed neural networks for fluid dynamics"
     )
-    search_btn = st.button("Find Supervisors", type="primary")
-
-# Main Execution
-if search_btn:
-    combined_query = research_summary
     
+    year_filter = st.slider("Only consider papers published after:", min_value=2018, max_value=2026, value=2021)
+    submit_btn = st.button("Find Matching Supervisors", type="primary")
+
+if submit_btn:
+    raw_cv_text = ""
+    extracted_keywords = []
+
     if cv_file:
-        parsed_cv = extract_pdf_text(cv_file)
-        # Use top 1000 characters from CV to prevent token overflow
-        combined_query += " " + parsed_cv[:1000]
+        raw_cv_text = extract_text_from_pdf(cv_file)
+        if raw_cv_text:
+            st.success(f"✓ Parsed {len(raw_cv_text.split())} words from CV.")
+            extracted_keywords = extract_phd_keywords(raw_cv_text, top_n=4)
+        else:
+            st.warning("Could not parse text from this PDF (it might be an image scan).")
 
-    if not combined_query.strip():
-        st.warning("Please provide a text summary or upload a CV.")
+    # Determine core search terms
+    search_query = ""
+    if manual_interest.strip():
+        search_query = manual_interest.strip()
+    elif extracted_keywords:
+        search_query = " ".join(extracted_keywords)
+    
+    if not search_query:
+        st.error("Please enter a research topic or upload a readable text PDF.")
     else:
-        with st.spinner("Searching global academic databases..."):
-            # 1. Query OpenAlex API
-            authors = search_openalex_authors(combined_query[:200])
+        st.info(f"Targeting search terms: **{search_query}**")
+        
+        with st.spinner("Querying peer-reviewed literature and identifying authors..."):
+            papers = search_semantic_scholar(search_query, limit=25)
             
-            if not authors:
-                st.info("No matching researchers found. Try broadening your keywords.")
+            if not papers:
+                st.warning("No papers found matching this exact query. Try refining or shortening your keywords.")
             else:
-                # 2. Semantic re-ranking using sentence embeddings
-                user_vec = embedder.encode([combined_query])
+                supervisors = {}
                 
-                results = []
-                for author in authors:
-                    # Compile researcher topic fingerprint
-                    topics = [c.get("display_name", "") for c in author.get("x_concepts", [])]
-                    inst = author.get("last_known_institution")
-                    inst_name = inst.get("display_name", "Unknown Institution") if inst else "Unknown Institution"
+                # Aggregate authors from relevant recent publications
+                for paper in papers:
+                    year = paper.get("year") or 0
+                    if year < year_filter:
+                        continue
                     
-                    profile_text = f"{author.get('display_name')} {inst_name} " + " ".join(topics)
-                    profile_vec = embedder.encode([profile_text])
+                    paper_title = paper.get("title", "Untitled")
+                    abstract = paper.get("abstract") or ""
+                    authors = paper.get("authors", [])
                     
-                    sim = cosine_similarity(user_vec, profile_vec)[0][0]
+                    if not authors:
+                        continue
                     
-                    results.append({
-                        "name": author.get("display_name"),
-                        "institution": inst_name,
-                        "works_count": author.get("works_count", 0),
-                        "h_index": author.get("summary_stats", {}).get("h_index", "N/A"),
-                        "topics": ", ".join(topics[:5]),
-                        "profile_url": author.get("id"),
-                        "similarity": round(float(sim) * 100, 1)
-                    })
-                
-                # Sort descending by similarity score
-                results = sorted(results, key=lambda x: x["similarity"], reverse=True)
+                    # In academic publishing, supervisors/PIs are almost always the last author (or first)
+                    candidate_authors = [authors[0]]
+                    if len(authors) > 1:
+                        candidate_authors.append(authors[-1])
+                        
+                    for auth in candidate_authors:
+                        auth_id = auth.get("authorId")
+                        auth_name = auth.get("name")
+                        
+                        if not auth_id or not auth_name:
+                            continue
+                            
+                        if auth_id not in supervisors:
+                            supervisors[auth_id] = {
+                                "name": auth_name,
+                                "profile_url": f"https://www.semanticscholar.org/author/{auth_id}",
+                                "papers": [],
+                                "citations": paper.get("citationCount", 0),
+                                "corpus": ""
+                            }
+                        
+                        supervisors[auth_id]["papers"].append({
+                            "title": paper_title,
+                            "year": year,
+                            "venue": paper.get("venue", "Conference/Journal"),
+                            "abstract": abstract
+                        })
+                        supervisors[auth_id]["corpus"] += f" {paper_title} {abstract}"
 
-                # 3. Display Results
-                st.subheader(f"Top Matches ({len(results)})")
+                # Rank supervisors based on cosine similarity against user query/CV
+                comparison_text = raw_cv_text if raw_cv_text else search_query
+                all_profiles = list(supervisors.values())
                 
-                for r in results:
-                    with st.container(border=True):
-                        col1, col2 = st.columns([3, 1])
-                        with col1:
-                            st.markdown(f"### [{r['name']}]({r['profile_url']})")
-                            st.write(f"🏛️ **Institution:** {r['institution']}")
-                            st.write(f"🔬 **Core Topics:** {r['topics']}")
-                        with col2:
-                            st.metric("Match Score", f"{r['similarity']}%")
-                            st.write(f"📚 Works: {r['works_count']} | H-Index: {r['h_index']}")
+                if not all_profiles:
+                    st.warning("No active authors found for the selected year window.")
+                else:
+                    texts_to_vectorize = [comparison_text] + [p["corpus"] for p in all_profiles]
+                    tfidf_matrix = TfidfVectorizer(stop_words='english').fit_transform(texts_to_vectorize)
+                    user_vec = tfidf_matrix[0]
+                    profile_vecs = tfidf_matrix[1:]
+                    
+                    sims = cosine_similarity(user_vec, profile_vecs)[0]
+                    
+                    for idx, profile in enumerate(all_profiles):
+                        profile["similarity"] = round(float(sims[idx]) * 100, 1)
+
+                    ranked_supervisors = sorted(all_profiles, key=lambda x: x["similarity"], reverse=True)
+                    
+                    st.subheader(f"Found {len(ranked_supervisors)} Potential Supervisors")
+                    
+                    for prof in ranked_supervisors[:10]:
+                        with st.container(border=True):
+                            c1, c2 = st.columns([3, 1])
+                            with c1:
+                                st.markdown(f"### [{prof['name']}]({prof['profile_url']})")
+                                st.markdown("**Relevant Recent Publication:**")
+                                top_paper = prof["papers"][0]
+                                st.write(f"📄 *{top_paper['title']}* ({top_paper['year']})")
+                                if top_paper['abstract']:
+                                    st.caption(top_paper['abstract'][:300] + "...")
+                            with c2:
+                                st.metric("Relevance Match", f"{prof['similarity']}%")
+                                st.write(f"Matched Papers: {len(prof['papers'])}")
