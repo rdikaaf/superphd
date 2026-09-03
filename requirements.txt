@@ -1,5 +1,1 @@
-streamlit
-pypdf
-requests
-sentence-transformers
-scikit-learn
+pip install streamlit pdfplumber requests scikit-learn
